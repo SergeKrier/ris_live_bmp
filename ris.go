@@ -1,3 +1,8 @@
+// Package main implements a bridge between the RIPE NCC RIS Live streaming API
+// and a BMP (BGP Monitoring Protocol) server. It consumes real-time BGP routing
+// messages from the RIS Live firehose, wraps each one in a BMP Route Monitoring
+// message (version 3), and forwards them over TCP to a configurable BMP server
+// such as gobmp.
 package main
 
 import (
@@ -16,8 +21,12 @@ import (
 	"github.com/sbezverk/gobmp/pkg/bmp"
 )
 
+// stream is the RIPE RIS Live SSE endpoint that delivers BGP update messages
+// as newline-delimited JSON.
 var stream = "https://ris-live.ripe.net/v1/stream/?format=json"
 
+// Command-line configuration for the target BMP server and the BGP Identifier
+// used in outgoing BMP messages.
 var (
 	bmpAddress string
 	bgpID      string
@@ -45,20 +54,28 @@ type RIS struct {
 	Data *RISData `json:"data,omitempty"`
 }
 
+// Message represents a BMP message composed of a Common Header and a
+// Per-Peer Header. The raw BGP payload is appended during serialization.
 type Message struct {
 	CommonHeader  *bmp.CommonHeader
 	PerPeerHeader *bmp.PerPeerHeader
 }
 
+// main connects to the RIS Live stream and the BMP server, then enters a loop
+// that reads each JSON message from the stream, converts it into a BMP Route
+// Monitoring message in a separate goroutine, and writes it to the BMP server.
+// Any goroutine error causes the program to exit.
 func main() {
 	flag.Parse()
 	_ = flag.Set("logtostderr", "true")
+	// Open an HTTP connection to the RIS Live SSE stream.
 	ris, err := http.Get(stream)
 	if err != nil {
 		glog.Errorf("failed to connect to RIS source with error: %+v", err)
 		os.Exit(1)
 	}
 	defer ris.Body.Close()
+	// Establish a TCP connection to the target BMP server.
 	bmpSrv, err := net.Dial("tcp", bmpAddress)
 	if err != nil {
 		glog.Errorf("failed to connect to destination with error: %+v", err)
@@ -67,6 +84,7 @@ func main() {
 	defer bmpSrv.Close()
 	glog.Infof("connection to bmp %v established", bmpSrv.RemoteAddr())
 
+	// Read the HTTP response body line-by-line; each line is one JSON message.
 	reader := bufio.NewReader(ris.Body)
 	errorCh := make(chan error)
 	for {
@@ -76,12 +94,15 @@ func main() {
 			glog.Errorf("failed to read message with error: %+v", err)
 			os.Exit(1)
 		}
+		// Process each message in its own goroutine to avoid blocking the reader.
 		go func(b []byte, errorCh chan error) {
+			// Decode the JSON-encoded RIS Live message.
 			if err := json.Unmarshal(b, m); err != nil {
 				glog.Errorf("failed to decode streamed message with error: %+v", err)
 				errorCh <- err
 				return
 			}
+			// Build the BMP Route Monitoring message from the RIS data.
 			bmpMsg := Message{}
 			bmpMsg.CommonHeader = &bmp.CommonHeader{
 				Version:     3,
@@ -124,11 +145,14 @@ func main() {
 			binary.BigEndian.PutUint32(bmpMsg.PerPeerHeader.PeerTimestamp[0:4], uint32(sec))
 			binary.BigEndian.PutUint32(bmpMsg.PerPeerHeader.PeerTimestamp[4:8], uint32(msec))
 
+			// Decode the hex-encoded raw BGP message payload.
 			raw, err := hex.DecodeString(m.Data.Raw)
 			if err != nil {
 				glog.Warningf("invalid raw data, failed to decode with error: %+v", err)
 			}
 
+			// Assemble the final BMP message: Common Header (6 bytes) +
+			// Per-Peer Header (42 bytes) + raw BGP payload.
 			bmpMsg.CommonHeader.MessageLength = int32(6 + 42 + len(raw))
 			b1, _ := bmpMsg.CommonHeader.Serialize()
 			b2, _ := bmpMsg.PerPeerHeader.Serialize()
@@ -137,6 +161,7 @@ func main() {
 			copy(fullMsg[6:], b2)
 			copy(fullMsg[48:], raw)
 
+			// Send the assembled BMP message to the server.
 			if _, err := bmpSrv.Write(fullMsg); err != nil {
 				glog.Errorf("fail to write to server %+v with error: %+v", bmpSrv.RemoteAddr(), err)
 				errorCh <- err
